@@ -1,21 +1,23 @@
 # PDF to JSON Extractor API
 
-A small FastAPI service that extracts structured listing information from Japanese real-estate PDFs and images using Google GenAI (Gemini) and local PDF processing.
-It can also scrape supported Japanese property web pages and return English JSON.
+A FastAPI service that extracts structured listing data from Japanese real-estate PDFs, images, and supported property web pages.
+This project combines local PDF/image extraction with Google GenAI (Gemini) and a web scraper to produce JSON output.
 
-## Features
-- Upload PDF or image files and receive a JSON schema with extracted fields
-- Submit a Japanese property page URL and receive English listing JSON
-- Optionally use Google Vertex AI or API Key for the Google GenAI (Gemini) model
-- OCR and text-extraction via local tools; outputs saved to `outputs/`
+## Key Features
+- Upload PDF or image files for structured JSON extraction
+- Extract JSON from supported Japanese property web URLs
+- Save extracted results to disk in `outputs/`
+- Provide download links for saved JSON files
+- Supports Google GenAI via API key or Vertex AI
 
 ## Requirements
 - Python 3.10+
 - Git
-- A Google GenAI credential: either `GOOGLE_API_KEY` or Vertex AI settings (`GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`).
+- A Google GenAI credential:
+  - `GOOGLE_API_KEY`, or
+  - Vertex AI settings: `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`
 
-## Quickstart
-
+## Setup
 1. Create and activate a virtual environment
 
 ```bash
@@ -26,16 +28,16 @@ pip install -r requirements.txt
 playwright install
 ```
 
-2. Create a `.env` file in the project root with one of the following options:
+2. Create a `.env` file in the project root
 
-API key example:
+Example with API key:
 
 ```text
 GOOGLE_API_KEY=your_api_key_here
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-Vertex AI example:
+Example with Vertex AI:
 
 ```text
 GOOGLE_GENAI_USE_VERTEXAI=true
@@ -50,19 +52,30 @@ GEMINI_MODEL=gemini-2.5-flash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-4. Health check
+4. Open Swagger UI
 
-```bash
-curl http://localhost:8000/healthz
-```
+Visit `http://localhost:8000/docs` to explore and test the API interactively.
 
-5. Extract from a file
+## API Endpoints
+
+### Health check
+- `GET /healthz`
+- Returns: `{ "status": "ok" }`
+
+### Extract from file
+- `POST /extract`
+- Form field: `file` (PDF or image)
+- Example:
 
 ```bash
 curl -X POST "http://localhost:8000/extract" -F "file=@/path/to/file.pdf"
 ```
 
-6. Extract from a Japanese property web URL
+### Extract from a web URL
+- `POST /extract/url`
+- JSON body: `{ "url": "https://example.com" }`
+- Returns saved JSON metadata plus extracted data
+- Example:
 
 ```bash
 curl -X POST "http://localhost:8000/extract/url" \
@@ -70,7 +83,10 @@ curl -X POST "http://localhost:8000/extract/url" \
   -d '{"url":"https://suumo.jp/ms/chuko/tokyo/sc_minato/nc_78986958/"}'
 ```
 
-7. Extract multiple URLs
+### Extract multiple URLs
+- `POST /extract/url-batch`
+- JSON body: `{ "urls": ["https://url1", "https://url2"] }`
+- Example:
 
 ```bash
 curl -X POST "http://localhost:8000/extract/url-batch" \
@@ -78,12 +94,23 @@ curl -X POST "http://localhost:8000/extract/url-batch" \
   -d '{"urls":["https://suumo.jp/ms/chuko/tokyo/sc_minato/nc_78986958/"]}'
 ```
 
-## Outputs
-- Successful extractions are written to `outputs/{requestId}.json`.
+### Download saved JSON
+- `GET /download/{request_id}`
+- Downloads the saved extraction JSON file from `outputs/{request_id}.json`
 
-## Tests
+## Output Files
+- Extracted JSON results are saved under `outputs/`
+- `requestId` values are returned by `/extract/url` and `/extract/url-batch`
+- Use the returned `downloadUrl` to fetch the saved JSON file
 
-Run the project's tests with:
+## Configuration
+- The URL scraper directory defaults to `../intelligent-web-scrapper`
+- Override with `WEB_SCRAPER_DIR=/path/to/intelligent-web-scrapper`
+- Additional options may be configured in `app/core/config.py`
+
+## Testing
+
+Run tests with:
 
 ```bash
 pytest -q
@@ -91,15 +118,13 @@ pytest -q
 
 ## Docker
 
-The repository contains a `Dockerfile` and `docker-compose.yml`. You may use Docker if you prefer; ensure your environment variables are supplied to the container.
-
-## Configuration
-- See `app/core/config.py` for configurable options (locale, model name, MAX_PAGES, etc.).
-- The URL scraper is loaded from `../intelligent-web-scrapper` by default. Set `WEB_SCRAPER_DIR=/path/to/intelligent-web-scrapper` if that folder lives somewhere else.
+This repository includes a `Dockerfile` and `docker-compose.yml`.
+If you use Docker, make sure environment variables are provided to the container.
 
 ## Troubleshooting
-- If you see errors about missing Google credentials, set the environment variables in `.env` or export them in the shell.
-- If model responses are empty or invalid JSON, check connectivity and that `GEMINI_MODEL` is correct.
+- Missing Google credentials: verify `.env` or shell exports
+- Invalid scraper import: confirm `WEB_SCRAPER_DIR` points to a valid scraper project
+- Playwright issues: run `playwright install`
 
 ## License
-This project is provided as-is. Check repository license for details.
+This project is provided as-is. See repository license for details.
