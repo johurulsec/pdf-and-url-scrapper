@@ -1,0 +1,19 @@
+api.dlabai.com {
+    # Allow big uploads (PDFs/images)
+    request_body {
+        max_size 200MB
+    }
+
+    # Optional: simple CORS for browser clients / Swagger UI
+    header {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET,POST,OPTIONS"
+        Access-Control-Allow-Headers "Content-Type,Authorization"
+    }
+
+    # Gzip/brotli
+    encode gzip zstd
+
+    # Proxy to the FastAPI service by its Docker service name
+    reverse_proxy http://api:8000
+}
