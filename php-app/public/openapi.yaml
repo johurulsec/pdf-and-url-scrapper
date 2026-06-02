@@ -1,0 +1,219 @@
+openapi: 3.0.3
+info:
+  title: PHP PDF to JSON Extractor API
+  version: 1.0.0
+  description: Local Swagger UI for testing the PHP Hostinger-ready API.
+servers:
+  - url: http://127.0.0.1:8000
+    description: Local PHP development server
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: API status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /health/browser-scraper:
+    get:
+      summary: Browser scraper fallback health check
+      responses:
+        "200":
+          description: Fallback scraper status
+          content:
+            application/json:
+              schema:
+                type: object
+  /extract:
+    post:
+      summary: Extract JSON from a PDF or image file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Extracted listing JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractEnvelope"
+        "400":
+          description: Missing or empty file
+        "500":
+          description: Extraction failed
+  /extract/url:
+    post:
+      summary: Extract JSON from a web page URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: https://example.com/property
+      responses:
+        "200":
+          description: Saved extraction response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requestId:
+                    type: string
+                  downloadUrl:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/ExtractEnvelope"
+        "400":
+          description: Invalid URL
+        "500":
+          description: Extraction failed
+  /extract/url-batch:
+    post:
+      summary: Extract JSON from multiple web page URLs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - urls
+              properties:
+                urls:
+                  type: array
+                  items:
+                    type: string
+                    format: uri
+                  example:
+                    - https://example.com/property
+      responses:
+        "200":
+          description: Batch extraction response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+        "500":
+          description: Batch extraction failed
+  /debug/url:
+    post:
+      summary: Preview readable text scraped from a URL
+      description: Dev-only helper. Disabled when ENV=prod.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: https://example.com/property
+      responses:
+        "200":
+          description: Scraped text preview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  textLength:
+                    type: integer
+                  preview:
+                    type: string
+        "400":
+          description: Invalid URL
+        "500":
+          description: URL fetch or text extraction failed
+  /download/{request_id}:
+    get:
+      summary: Download a saved JSON result
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Saved JSON file
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: Result not found
+components:
+  schemas:
+    ExtractEnvelope:
+      type: object
+      properties:
+        schemaVersion:
+          type: string
+          example: "1.0"
+        requestId:
+          type: string
+        locale:
+          type: string
+          example: en-US
+        source:
+          type: object
+          properties:
+            fileName:
+              type: string
+              nullable: true
+            url:
+              type: string
+              nullable: true
+            runAt:
+              type: string
+            mode:
+              type: string
+              enum:
+                - inline-file
+                - url
+                - batch
+                - live-url
+            model:
+              type: string
+        listing:
+          type: object
+          nullable: true
+        raw:
+          type: object
+        meta:
+          type: object
