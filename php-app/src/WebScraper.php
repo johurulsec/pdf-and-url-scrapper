@@ -6,6 +6,9 @@ namespace App;
 
 final class WebScraper
 {
+    private const IMAGE_EXTENSION = '(?:jpe?g|png|webp|gif)';
+    private const IMAGE_URL_SUFFIX = self::IMAGE_EXTENSION . '(?:[?#][^"\'>\s)]*)?';
+
     public static function extractTextFromUrl(string $url, ?Config $config = null): string
     {
         try {
@@ -29,11 +32,35 @@ final class WebScraper
         return $text;
     }
 
+    public static function extractImageUrlsFromUrl(string $url, ?Config $config = null, int $limit = 0): array
+    {
+        try {
+            $html = self::fetchHtmlDirect($url);
+        } catch (\Throwable $primaryError) {
+            if (!$config || !$config->remoteFetchUrlTemplate) {
+                return [];
+            }
+
+            try {
+                $html = self::extractHtmlViaRemoteFetcher($url, $config);
+            } catch (\Throwable) {
+                return [];
+            }
+        }
+
+        return self::imageUrlsFromHtml(self::toUtf8($html), $url, $limit);
+    }
+
     private static function extractTextDirect(string $url): string
+    {
+        return self::htmlToListingText(self::toUtf8(self::fetchHtmlDirect($url)));
+    }
+
+    private static function fetchHtmlDirect(string $url): string
     {
         $cookieFile = tempnam(sys_get_temp_dir(), 'php_scraper_cookie_') ?: null;
         try {
-            $html = (string)Http::request('GET', $url, [
+            return (string)Http::request('GET', $url, [
                 'headers' => self::browserHeaders($url),
                 'referer' => self::origin($url),
                 'cookieFile' => $cookieFile,
@@ -45,8 +72,6 @@ final class WebScraper
                 @unlink($cookieFile);
             }
         }
-        $html = self::toUtf8($html);
-        return self::htmlToListingText($html);
     }
 
     private static function extractTextViaRemoteFetcher(string $url, Config $config, \Throwable $primaryError): string
@@ -70,6 +95,32 @@ final class WebScraper
         }
 
         return $text;
+    }
+
+    private static function extractHtmlViaRemoteFetcher(string $url, Config $config): string
+    {
+        $remoteUrl = self::remoteUrl($url, $config);
+        $headers = [];
+        if ($config->remoteFetchApiKey && $config->remoteFetchApiKeyHeader) {
+            $headers[] = $config->remoteFetchApiKeyHeader . ': ' . $config->remoteFetchApiKey;
+        }
+
+        $body = (string)Http::request('GET', $remoteUrl, [
+            'headers' => $headers,
+            'timeout' => 120,
+        ]);
+        $trimmed = trim($body);
+        if ($config->remoteFetchJsonField || str_starts_with($trimmed, '{')) {
+            $data = json_decode($trimmed, true);
+            if (is_array($data)) {
+                $value = self::valueAtPath($data, (string)($config->remoteFetchJsonField ?: ''));
+                if (is_string($value) && $value !== '') {
+                    return $value;
+                }
+            }
+        }
+
+        return $body;
     }
 
     private static function remoteUrl(string $url, Config $config): string
@@ -136,6 +187,260 @@ final class WebScraper
             'Referer: ' . $origin . '/',
             'Upgrade-Insecure-Requests: 1',
         ];
+    }
+
+    private static function imageUrlsFromHtml(string $html, string $pageUrl, int $limit): array
+    {
+        $candidates = [];
+        foreach (self::orderedGalleryImageUrls($html, $pageUrl) as $url) {
+            $candidates[$url] = true;
+        }
+        if ($candidates && self::prefersOrderedGalleryOnly($pageUrl)) {
+            $urls = array_keys($candidates);
+            if (str_contains(parse_url($pageUrl, PHP_URL_HOST) ?: '', 'homes.co.jp')) {
+                $countHint = self::homesImageCountHint($html);
+                if ($countHint > 0) {
+                    $urls = array_slice($urls, 0, $countHint);
+                }
+            }
+            return $limit > 0 ? array_slice($urls, 0, $limit) : $urls;
+        }
+
+        if (class_exists(\DOMDocument::class)) {
+            $previous = libxml_use_internal_errors(true);
+            $dom = new \DOMDocument();
+            $dom->loadHTML('<?xml encoding="UTF-8">' . $html);
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+
+            foreach ($dom->getElementsByTagName('img') as $img) {
+                foreach (['src', 'data-src', 'data-original', 'data-lazy', 'data-srcset', 'srcset'] as $attr) {
+                    if ($img->hasAttribute($attr)) {
+                        self::addImageCandidate($candidates, $img->getAttribute($attr), $pageUrl);
+                    }
+                }
+            }
+
+            foreach ($dom->getElementsByTagName('source') as $source) {
+                foreach (['srcset', 'data-srcset'] as $attr) {
+                    if ($source->hasAttribute($attr)) {
+                        self::addImageCandidate($candidates, $source->getAttribute($attr), $pageUrl);
+                    }
+                }
+            }
+        }
+
+        if (preg_match_all('/(?:https?:)?\/\/[^"\'<>\s)]+?\.' . self::IMAGE_URL_SUFFIX . '/iu', $html, $matches)) {
+            foreach ($matches[0] as $candidate) {
+                self::addImageCandidate($candidates, $candidate, $pageUrl);
+            }
+        }
+
+        $urls = array_keys($candidates);
+        return $limit > 0 ? array_slice($urls, 0, $limit) : $urls;
+    }
+
+    private static function orderedGalleryImageUrls(string $html, string $pageUrl): array
+    {
+        $gallery = [];
+
+        if (preg_match_all('/<[^>]+class=["\'][^"\']*(?:js-lightboxItem|carousel_item-object)[^"\']*["\'][^>]*>/isu', $html, $matches)) {
+            foreach ($matches[0] as $tag) {
+                if (!preg_match('/\bdata-src=["\']([^"\']+)["\']/isu', $tag, $src)) {
+                    continue;
+                }
+
+                $id = 100000 + count($gallery);
+                if (preg_match('/\bdata-id=["\']?([0-9]+)/isu', $tag, $idMatch)) {
+                    $id = (int)$idMatch[1];
+                }
+
+                $normalized = self::normalizedImageUrl($src[1], $pageUrl);
+                if ($normalized) {
+                    $gallery[$id . '-' . count($gallery)] = $normalized;
+                }
+            }
+        }
+
+        if (preg_match_all('#<photo-slider-photo\b[^>]*\bdata-index=["\']?([0-9]+)[^>]*>.*?<img\b[^>]*\bsrc=["\']([^"\']+)["\']#isu', $html, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $normalized = self::normalizedImageUrl($match[2], $pageUrl);
+                if ($normalized) {
+                    $gallery[(int)$match[1] . '-' . count($gallery)] = $normalized;
+                }
+            }
+        }
+
+        if (preg_match_all('#<li\b[^>]*class=["\'][^"\']*prg-galleryItem[^"\']*["\'][^>]*\bdata-index=["\']?([0-9]+)[^>]*>.*?<img\b[^>]*\bsrc=["\']([^"\']+)["\']#isu', $html, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $normalized = self::normalizedImageUrl($match[2], $pageUrl);
+                if ($normalized) {
+                    $gallery[(int)$match[1] . '-' . count($gallery)] = $normalized;
+                }
+            }
+        }
+
+        if (preg_match_all('#<img\b[^>]*\bsrc=["\']([^"\']*/image_files/path/[^"\']*width=572[^"\']*height=418[^"\']*)["\']#isu', $html, $matches)) {
+            foreach ($matches[1] as $src) {
+                $normalized = self::normalizedImageUrl($src, $pageUrl);
+                if ($normalized) {
+                    $gallery[100000 + count($gallery)] = $normalized;
+                }
+            }
+        }
+
+        if (!$gallery && str_contains(parse_url($pageUrl, PHP_URL_HOST) ?: '', 'homes.co.jp')) {
+            $gallery = self::homesOrderedImages($html, $pageUrl);
+        }
+
+        if (!$gallery && preg_match_all('/\b(?:data-src|rel)=["\']([^"\']*\/front\/gazo\/bukken\/[^"\']+)["\']/isu', $html, $matches)) {
+            foreach ($matches[1] as $src) {
+                $normalized = self::normalizedImageUrl($src, $pageUrl);
+                if ($normalized) {
+                    $gallery[] = $normalized;
+                }
+            }
+        }
+
+        ksort($gallery, SORT_NATURAL);
+        return array_values(array_unique($gallery));
+    }
+
+    private static function homesOrderedImages(string $html, string $pageUrl): array
+    {
+        $start = stripos($html, '<photo-slider');
+        if ($start === false) {
+            $start = stripos($html, 'prg-galleryItems');
+        }
+        if ($start === false) {
+            return [];
+        }
+
+        $countHint = self::homesImageCountHint($html);
+        $chunkLength = $countHint > 0 ? max(30000, $countHint * 2500) : 90000;
+        $chunk = substr($html, $start, $chunkLength);
+        if (!preg_match_all('#<img\b[^>]*\bsrc=["\']([^"\']*image[0-9]?\.homes\.jp[^"\']*)["\']#isu', $chunk, $matches)) {
+            return [];
+        }
+
+        $gallery = [];
+        foreach ($matches[1] as $src) {
+            $normalized = self::normalizedImageUrl($src, $pageUrl);
+            if ($normalized) {
+                $gallery[] = $normalized;
+            }
+            if ($countHint > 0 && count(array_unique($gallery)) >= $countHint) {
+                break;
+            }
+        }
+
+        return array_values(array_unique($gallery));
+    }
+
+    private static function prefersOrderedGalleryOnly(string $pageUrl): bool
+    {
+        $host = parse_url($pageUrl, PHP_URL_HOST) ?: '';
+        return str_contains($host, 'suumo.jp')
+            || str_contains($host, 'homes.co.jp')
+            || str_contains($host, 'athome.co.jp');
+    }
+
+    private static function homesImageCountHint(string $html): int
+    {
+        $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if (preg_match('/"number_of_image"\s*:\s*\[\s*"?([0-9]+)/iu', $decoded, $m)) {
+            return (int)$m[1];
+        }
+        if (preg_match('/number_of_image(?:&quot;|")\s*:\s*(?:\[(?:&quot;|")?)?([0-9]+)/iu', $html, $m)) {
+            return (int)$m[1];
+        }
+        if (preg_match('/>\s*1\s*\/\s*([0-9]{1,3})\s*</u', $html, $m)) {
+            return (int)$m[1];
+        }
+        return 0;
+    }
+
+    private static function addImageCandidate(array &$out, string $value, string $pageUrl): void
+    {
+        foreach (preg_split('/\s*,\s*/u', html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8')) ?: [] as $part) {
+            $absolute = self::normalizedImageUrl($part, $pageUrl);
+            if ($absolute) {
+                $out[$absolute] = true;
+            }
+        }
+    }
+
+    private static function normalizedImageUrl(string $value, string $pageUrl): ?string
+    {
+        $url = trim(preg_replace('/\s+\d+[wx]$/iu', '', html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8')) ?: '');
+        if ($url === '' || str_starts_with($url, 'data:')) {
+            return null;
+        }
+        if (preg_match('#(?:icon|logo|sprite|loading|blank|noimage|map|qr|button|banner|spacer|pagetop|jjcommon|assets/suumo/img/include|btn\.|homes-kun|header-footer|static_app_contents|/assets/(?:common|pc|images|img|css|js)/)#iu', $url)) {
+            return null;
+        }
+
+        $absolute = self::canonicalImageUrl(self::absoluteUrl($url, $pageUrl));
+        if (!$absolute || !filter_var($absolute, FILTER_VALIDATE_URL)) {
+            return null;
+        }
+
+        $path = parse_url($absolute, PHP_URL_PATH) ?: '';
+        $query = parse_url($absolute, PHP_URL_QUERY) ?: '';
+        $full = $path . ($query ? '?' . $query : '');
+        $decodedFull = rawurldecode($full);
+        if (
+            preg_match('/\.' . self::IMAGE_EXTENSION . '$/iu', $path)
+            || preg_match('#/front/gazo/bukken/#iu', $absolute)
+            || preg_match('#/image_files/path/#iu', $absolute)
+            || preg_match('#^https://image[0-9]?\.homes\.jp/.*/image\.php\?#iu', $absolute)
+            || preg_match('/\.' . self::IMAGE_EXTENSION . '(?:[?&]|$)/iu', $decodedFull)
+        ) {
+            return $absolute;
+        }
+
+        return null;
+    }
+
+    private static function canonicalImageUrl(?string $url): ?string
+    {
+        if (!$url) {
+            return null;
+        }
+
+        $host = parse_url($url, PHP_URL_HOST) ?: '';
+        $path = parse_url($url, PHP_URL_PATH) ?: '';
+        $query = parse_url($url, PHP_URL_QUERY) ?: '';
+
+        if (str_contains($host, 'athome.co.jp') && str_contains($path, '/image_files/path/')) {
+            return self::origin($url) . $path;
+        }
+
+        if (preg_match('/^image[0-9]?\.homes\.jp$/iu', $host) && str_ends_with($path, '/image.php')) {
+            parse_str($query, $params);
+            if (!empty($params['file']) && is_string($params['file'])) {
+                return self::origin($url) . $path . '?file=' . rawurlencode($params['file']);
+            }
+        }
+
+        return $url;
+    }
+
+    private static function absoluteUrl(string $url, string $pageUrl): ?string
+    {
+        if (str_starts_with($url, '//')) {
+            return (parse_url($pageUrl, PHP_URL_SCHEME) ?: 'https') . ':' . $url;
+        }
+        if (preg_match('#^https?://#iu', $url)) {
+            return $url;
+        }
+        if (str_starts_with($url, '/')) {
+            return self::origin($pageUrl) . $url;
+        }
+
+        $path = parse_url($pageUrl, PHP_URL_PATH) ?: '/';
+        $base = preg_replace('#/[^/]*$#', '/', $path) ?: '/';
+        return self::origin($pageUrl) . $base . $url;
     }
 
     private static function origin(string $url): string

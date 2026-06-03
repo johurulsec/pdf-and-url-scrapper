@@ -67,6 +67,7 @@ PROMPT;
             $env = BrowserScraperFallback::extract($this->config, $url);
             $env['meta']['phpFallback'] = 'browser-scraper';
             $env['meta']['phpFallbackReason'] = 'rakumachi-preferred-browser-rendering';
+            $this->attachImageUrls($env, $url);
             $this->saveEnvelope($env);
 
             return [
@@ -95,7 +96,6 @@ PROMPT;
             $env = BrowserScraperFallback::extract($this->config, $url);
             $env['meta']['phpFallback'] = 'browser-scraper';
             $env['meta']['phpFallbackReason'] = $primaryError->getMessage();
-            $this->saveEnvelope($env);
         }
 
         if (!isset($env)) {
@@ -113,9 +113,11 @@ PROMPT;
                 $env = $this->buildEnvelope($exactRaw, null, $url, 'live-url', $start);
                 $env['meta']['modelFallback'] = 'exact-text';
                 $env['meta']['modelFallbackReason'] = $modelError->getMessage();
-                $this->saveEnvelope($env);
             }
         }
+
+        $this->attachImageUrls($env, $url);
+        $this->saveEnvelope($env);
 
         return [
             'requestId' => $env['requestId'],
@@ -279,6 +281,20 @@ PROMPT;
         $this->saveEnvelope($env);
 
         return $env;
+    }
+
+    private function attachImageUrls(array &$env, string $url): void
+    {
+        $imageUrls = WebScraper::extractImageUrlsFromUrl($url, $this->config);
+        if (!$imageUrls) {
+            return;
+        }
+
+        if (!isset($env['listing']) || !is_array($env['listing'])) {
+            $env['listing'] = [];
+        }
+        $env['listing']['imageUrls'] = $imageUrls;
+        $env['meta']['imageUrlCount'] = count($imageUrls);
     }
 
     private function saveEnvelope(array $env): void
