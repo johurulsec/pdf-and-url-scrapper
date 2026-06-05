@@ -28,6 +28,12 @@ final class Config
     public ?string $remoteFetchApiKey;
     public ?string $remoteFetchApiKeyHeader;
     public ?string $remoteFetchJsonField;
+    public bool $jinaReaderEnabled;
+    public ?string $jinaApiKey;
+    public bool $playwrightRendererEnabled;
+    public string $playwrightNodeBin;
+    public string $playwrightScriptPath;
+    public int $playwrightTimeoutMs;
 
     public function __construct(string $rootDir)
     {
@@ -60,6 +66,12 @@ final class Config
         $this->remoteFetchApiKey = getenv('REMOTE_FETCH_API_KEY') ?: null;
         $this->remoteFetchApiKeyHeader = getenv('REMOTE_FETCH_API_KEY_HEADER') ?: null;
         $this->remoteFetchJsonField = getenv('REMOTE_FETCH_JSON_FIELD') ?: null;
+        $this->jinaReaderEnabled = $this->envBool('JINA_READER_ENABLED', true);
+        $this->jinaApiKey = getenv('JINA_API_KEY') ?: null;
+        $this->playwrightRendererEnabled = $this->envBool('PLAYWRIGHT_RENDERER_ENABLED', false);
+        $this->playwrightNodeBin = getenv('PLAYWRIGHT_NODE_BIN') ?: 'node';
+        $this->playwrightScriptPath = getenv('PLAYWRIGHT_SCRIPT_PATH') ?: $rootDir . '/scripts/render-page.js';
+        $this->playwrightTimeoutMs = max(5000, (int)(getenv('PLAYWRIGHT_TIMEOUT_MS') ?: 45000));
     }
 
     private function loadEnv(string $path): void

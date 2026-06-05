@@ -60,27 +60,33 @@ try {
             Http::json($extractor->runUrlExtraction($url));
         } catch (Throwable $e) {
             $message = $e->getMessage();
-            $isGatewayError = str_contains($message, 'HTTP ')
+            $isExpired = str_contains($message, '[listing-expired]');
+            $isGatewayError = !$isExpired && (
+                str_contains($message, 'HTTP ')
                 || str_contains($message, 'URL ')
                 || str_contains($message, 'cURL')
                 || str_contains($message, 'scraper')
                 || str_contains($message, 'readable HTML')
-                || str_contains($message, 'browser rendering');
+                || str_contains($message, 'browser rendering')
+                || str_contains($message, 'strategies exhausted')
+            );
             $isGeminiError = str_contains($message, 'generativelanguage.googleapis.com')
                 || str_contains($message, 'GOOGLE_API_KEY')
                 || str_contains($message, 'model-')
                 || str_contains($message, 'Bad JSON from model');
-            $isRakumachi = str_contains(parse_url($url, PHP_URL_HOST) ?: '', 'rakumachi.jp');
-            $isHomes = str_contains(parse_url($url, PHP_URL_HOST) ?: '', 'homes.co.jp');
+
+            if ($isExpired) {
+                Http::json([
+                    'detail' => 'Listing no longer available — the property has been removed or the URL has expired.',
+                    'url' => $url,
+                    'hint' => 'The page was fetched successfully but it shows a "not found" or "listing ended" message. The property was likely sold or delisted.',
+                ], 410);
+            }
 
             $status = $isGeminiError ? 503 : ($isGatewayError ? 502 : 500);
             $hint = 'The PHP app could not complete URL extraction. Test POST /debug/url first to see the exact fetch result.';
             if ($isGeminiError) {
                 $hint = 'The URL was fetched, but Gemini/API processing failed. Check GOOGLE_API_KEY, GEMINI_MODEL, API enablement, and quota.';
-            } elseif ($isRakumachi) {
-                $hint = 'Rakumachi blocks plain PHP cURL for these pages. On Hostinger/shared PHP, configure REMOTE_FETCH_URL_TEMPLATE with a scraping API that returns HTML or text.';
-            } elseif ($isHomes) {
-                $hint = 'HOMES is usually fetchable with PHP cURL. If this still fails, inspect /debug/url and check whether Gemini/API processing is returning an error.';
             }
 
             Http::json([

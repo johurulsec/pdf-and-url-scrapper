@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "install:playwright": "playwright install chromium",
+    "render:url": "node scripts/render-page.js"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  },
+  "devDependencies": {}
+}

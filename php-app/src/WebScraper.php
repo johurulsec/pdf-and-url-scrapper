@@ -9,27 +9,112 @@ final class WebScraper
     private const IMAGE_EXTENSION = '(?:jpe?g|png|webp|gif)';
     private const IMAGE_URL_SUFFIX = self::IMAGE_EXTENSION . '(?:[?#][^"\'>\s)]*)?';
 
+    // Prefix on exceptions that must propagate through all tier catch blocks
+    private const EXPIRED_MARKER = '[listing-expired] ';
+
     public static function extractTextFromUrl(string $url, ?Config $config = null): string
     {
-        try {
-            $text = self::extractTextDirect($url);
+        $errors = [];
+
+        // Shared validator: returns text when good, null when thin/blocked, throws when expired.
+        // Expired exceptions carry EXPIRED_MARKER and must be re-thrown by every catch block.
+        $validate = static function (string $text, string $label) use (&$errors): ?string {
             if (self::looksBlocked($text)) {
-                throw new \RuntimeException('URL returned a readable block/access-denied page instead of listing content.');
+                $errors[] = $label . ': blocked response';
+                return null;
             }
-        } catch (\Throwable $primaryError) {
-            if (!$config || !$config->remoteFetchUrlTemplate) {
-                throw $primaryError;
+            if (self::looksExpired($text)) {
+                throw new \RuntimeException(
+                    self::EXPIRED_MARKER
+                    . 'This property listing has been removed or is no longer available on this site.'
+                );
             }
-            $text = self::extractTextViaRemoteFetcher($url, $config, $primaryError);
+            if (self::isEnoughText($text)) {
+                return $text;
+            }
+            $errors[] = $label . ': insufficient content (' . self::len($text) . ' chars)';
+            return null;
+        };
+
+        // Tier 1-3: multiple cURL User-Agent/header strategies
+        foreach (self::buildCurlStrategies($url) as $label => $opts) {
+            try {
+                $cookieFile = tempnam(sys_get_temp_dir(), 'php_sc_') ?: null;
+                try {
+                    $html = (string)Http::request('GET', $url, array_merge($opts, [
+                        'cookieFile' => $cookieFile,
+                        'timeout' => $opts['timeout'] ?? 45,
+                    ]));
+                } finally {
+                    if ($cookieFile && is_file($cookieFile)) {
+                        @unlink($cookieFile);
+                    }
+                }
+                $text = self::htmlToListingText(self::toUtf8($html));
+                if (($result = $validate($text, $label)) !== null) {
+                    return $result;
+                }
+            } catch (\Throwable $e) {
+                if (str_starts_with($e->getMessage(), self::EXPIRED_MARKER)) {
+                    throw $e;
+                }
+                $errors[] = $label . ': ' . $e->getMessage();
+            }
         }
 
-        if (self::len($text) < 80) {
-            throw new \RuntimeException(
-                'URL page did not return enough readable text. This site may require JavaScript/browser rendering, login, or may block shared-hosting cURL requests.'
-            );
+        // Tier 4: Jina Reader — free web-to-text proxy, handles JS and IP blocks
+        if (!$config || $config->jinaReaderEnabled) {
+            try {
+                $text = self::extractTextViaJinaReader($url, $config);
+                if (($result = $validate($text, 'jina-reader')) !== null) {
+                    return $result;
+                }
+            } catch (\Throwable $e) {
+                if (str_starts_with($e->getMessage(), self::EXPIRED_MARKER)) {
+                    throw $e;
+                }
+                $errors[] = 'jina-reader: ' . $e->getMessage();
+            }
         }
 
-        return $text;
+        // Tier 5: Remote Fetch Template (needs REMOTE_FETCH_URL_TEMPLATE in .env)
+        if ($config && $config->remoteFetchUrlTemplate) {
+            try {
+                $text = self::extractTextViaRemoteFetcher(
+                    $url,
+                    $config,
+                    new \RuntimeException(implode(' | ', $errors))
+                );
+                if (($result = $validate($text, 'remote-fetch')) !== null) {
+                    return $result;
+                }
+            } catch (\Throwable $e) {
+                if (str_starts_with($e->getMessage(), self::EXPIRED_MARKER)) {
+                    throw $e;
+                }
+                $errors[] = 'remote-fetch: ' . $e->getMessage();
+            }
+        }
+
+        // Tier 6: Playwright (needs Node.js + playwright installed)
+        if ($config && $config->playwrightRendererEnabled) {
+            try {
+                $text = self::extractTextViaPlaywright($url, $config);
+                if (($result = $validate($text, 'playwright')) !== null) {
+                    return $result;
+                }
+            } catch (\Throwable $e) {
+                if (str_starts_with($e->getMessage(), self::EXPIRED_MARKER)) {
+                    throw $e;
+                }
+                $errors[] = 'playwright: ' . $e->getMessage();
+            }
+        }
+
+        throw new \RuntimeException(
+            'All scraping strategies exhausted — could not extract enough readable text from this URL. '
+            . 'Attempts: ' . implode(' | ', $errors)
+        );
     }
 
     public static function extractImageUrlsFromUrl(string $url, ?Config $config = null, int $limit = 0): array
@@ -48,12 +133,164 @@ final class WebScraper
             }
         }
 
-        return self::imageUrlsFromHtml(self::toUtf8($html), $url, $limit);
+        $urls = self::imageUrlsFromHtml(self::toUtf8($html), $url, $limit);
+        if ($urls || !$config || !$config->playwrightRendererEnabled) {
+            return $urls;
+        }
+
+        try {
+            $rendered = self::renderViaPlaywright($url, $config);
+            $renderedUrls = [];
+            foreach (($rendered['images'] ?? []) as $imageUrl) {
+                if (is_string($imageUrl)) {
+                    self::addImageCandidate($renderedUrls, $imageUrl, $url);
+                }
+            }
+            if (isset($rendered['html']) && is_string($rendered['html'])) {
+                foreach (self::imageUrlsFromHtml(self::toUtf8($rendered['html']), $url, 0) as $imageUrl) {
+                    $renderedUrls[$imageUrl] = true;
+                }
+            }
+            $urls = array_keys($renderedUrls);
+            return $limit > 0 ? array_slice($urls, 0, $limit) : $urls;
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * Returns per-strategy cURL option arrays to try in sequence.
+     * Each entry may include keys: headers, userAgent, referer, timeout, expectHtml.
+     */
+    private static function buildCurlStrategies(string $url): array
+    {
+        $origin = self::origin($url);
+        return [
+            // Desktop Chrome — widest site support
+            'curl-desktop' => [
+                'headers' => self::browserHeaders($url),
+                'referer' => $origin,
+                'expectHtml' => true,
+                'timeout' => 45,
+            ],
+            // iPhone Safari — bypasses desktop-specific IP/UA blocks
+            'curl-mobile' => [
+                'headers' => [
+                    'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language: ja-JP,ja;q=0.9,en;q=0.8',
+                    'Cache-Control: no-cache',
+                    'Connection: keep-alive',
+                ],
+                'userAgent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+                'referer' => $origin,
+                'expectHtml' => true,
+                'timeout' => 30,
+            ],
+            // macOS Safari — different TLS/header fingerprint
+            'curl-safari-mac' => [
+                'headers' => [
+                    'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language: ja-JP,ja;q=0.9',
+                    'Accept-Encoding: gzip, deflate, br',
+                    'Connection: keep-alive',
+                    'Upgrade-Insecure-Requests: 1',
+                ],
+                'userAgent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+                'referer' => $origin,
+                'timeout' => 30,
+            ],
+        ];
+    }
+
+    /**
+     * Fetch page text via Jina Reader (r.jina.ai) — a free web-to-text proxy that
+     * handles JavaScript rendering and many IP-blocked sites server-side.
+     */
+    private static function extractTextViaJinaReader(string $url, ?Config $config): string
+    {
+        $jinaUrl = 'https://r.jina.ai/' . $url;
+        $headers = [
+            'Accept: text/plain, text/markdown, */*',
+            'X-Return-Format: text',
+            'X-With-Images-Summary: false',
+            'X-With-Links-Summary: false',
+        ];
+        if ($config && $config->jinaApiKey) {
+            $headers[] = 'Authorization: Bearer ' . $config->jinaApiKey;
+        }
+
+        $body = (string)Http::request('GET', $jinaUrl, [
+            'headers' => $headers,
+            'userAgent' => 'Mozilla/5.0',
+            'timeout' => 60,
+        ]);
+
+        return self::plainTextToListingText(self::toUtf8($body));
     }
 
     private static function extractTextDirect(string $url): string
     {
         return self::htmlToListingText(self::toUtf8(self::fetchHtmlDirect($url)));
+    }
+
+    private static function extractTextViaPlaywright(string $url, Config $config): string
+    {
+        $data = self::renderViaPlaywright($url, $config);
+        $chunks = [];
+        if (isset($data['html']) && is_string($data['html']) && $data['html'] !== '') {
+            $chunks[] = self::htmlToListingText(self::toUtf8($data['html']));
+        }
+        if (isset($data['text']) && is_string($data['text']) && $data['text'] !== '') {
+            $chunks[] = self::plainTextToListingText($data['text']);
+        }
+        foreach (($data['networkJson'] ?? []) as $item) {
+            if (is_array($item)) {
+                self::flattenJson($item, $chunks);
+            }
+        }
+
+        return self::slice(implode("\n", array_unique(array_filter($chunks))), 0, 60000);
+    }
+
+    private static function renderViaPlaywright(string $url, Config $config): array
+    {
+        if (!is_file($config->playwrightScriptPath)) {
+            throw new \RuntimeException('Playwright renderer script not found: ' . $config->playwrightScriptPath);
+        }
+
+        $command = implode(' ', [
+            escapeshellcmd($config->playwrightNodeBin),
+            escapeshellarg($config->playwrightScriptPath),
+            escapeshellarg($url),
+            escapeshellarg((string)$config->playwrightTimeoutMs),
+        ]);
+
+        $descriptorSpec = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+        $process = proc_open($command, $descriptorSpec, $pipes, $config->rootDir);
+        if (!is_resource($process)) {
+            throw new \RuntimeException('Could not start Playwright renderer process.');
+        }
+
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]) ?: '';
+        $stderr = stream_get_contents($pipes[2]) ?: '';
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+
+        $data = json_decode($stdout, true);
+        if ($exitCode !== 0 || !is_array($data)) {
+            throw new \RuntimeException(trim($stderr) ?: 'Playwright renderer failed.');
+        }
+        if (($data['status'] ?? 'ok') !== 'ok') {
+            throw new \RuntimeException((string)($data['error'] ?? 'Playwright renderer returned an error.'));
+        }
+
+        return $data;
     }
 
     private static function fetchHtmlDirect(string $url): string
@@ -497,7 +734,41 @@ final class WebScraper
 
     private static function looksBlocked(string $text): bool
     {
-        return preg_match('/(アクセスができません|Attention Required|Cloudflare|Access Denied|Forbidden|お使いの環境をご確認)/iu', $text) === 1;
+        return preg_match(
+            '/(アクセスができません|アクセスを制限|このページはご利用いただけません|ご利用いただけません'
+            . '|Attention Required|Cloudflare|Access Denied|Forbidden|お使いの環境をご確認'
+            . '|Bad Gateway|Gateway Timeout|Service Unavailable|Too Many Requests'
+            . '|CAPTCHA|Checking your browser|Enable JavaScript|JavaScript is required'
+            . '|403 Forbidden|502 Bad|503 Service|bot detection|アクセスが集中'
+            . '|認証にご協力|認証中.*ウェブブラウザ|通常のサイト閲覧を超える|ウェブブラウザを確認)/iu',
+            $text
+        ) === 1;
+    }
+
+    /**
+     * Returns true when the fetched page is a "listing removed / not found" page
+     * rather than an actual property listing. Prevents Gemini from being called
+     * with 404 content and returning all-null fields.
+     */
+    private static function looksExpired(string $text): bool
+    {
+        // Use non-dotall (no `s` flag) so .* never crosses newlines — prevents
+        // false positives from unrelated sentences on the same page.
+        return preg_match(
+            '/(お探しのページが見つかりません|お探しのページは見つかりません'
+            . '|ページ[はが]見つかりませんでした|ページが見つかりません'
+            . '|物件情報が見つかりません|物件が見つかりませんでした'
+            . '|物件の掲載は終了|この物件の情報は終了|この物件は削除'
+            . '|お探しの物件は.{0,20}掲載.{0,10}終了|お探しの情報は.{0,20}掲載が終了'
+            . '|掲載が終了しているか|掲載を終了しました'
+            . '|ご指定のページは見つかりません|This listing has ended)/iu',
+            $text
+        ) === 1;
+    }
+
+    private static function isEnoughText(string $text): bool
+    {
+        return self::len($text) >= 80 && !self::looksBlocked($text);
     }
 
     private static function plainTextToListingText(string $text): string

@@ -16,6 +16,7 @@ PHP version replaces those parts with PHP routing and Gemini REST calls.
 - A Google Gemini API key
 - Optional: Google Translate API key
 - Optional: Google Maps API key
+- Optional: Node.js + Playwright for local browser-rendered URL fallback
 
 ## Setup
 
@@ -41,6 +42,7 @@ REMOTE_FETCH_API_KEY=
 REMOTE_FETCH_API_KEY_HEADER=
 REMOTE_FETCH_JSON_FIELD=
 PREFER_BROWSER_SCRAPER_FOR_RAKUMACHI=false
+PLAYWRIGHT_RENDERER_ENABLED=false
 ```
 
 5. Make `php-app/outputs` writable by PHP.
@@ -86,7 +88,7 @@ Feature comparison:
 - Same: Gemini-based JSON extraction, normalization, geocoding, translation, saved output JSON.
 - Different: no FastAPI/Pydantic because this is plain PHP.
 - Different: no PyMuPDF PDF rasterization on shared hosting; PDFs are sent directly to Gemini.
-- Different: no Python Playwright scraper; URL extraction uses browser-like PHP cURL plus HTML/JSON-LD/table text extraction. Sites that require JavaScript rendering or block hosting-provider IPs may still need a PHP-callable remote scraping API.
+- Different: no Python Playwright scraper; URL extraction uses browser-like PHP cURL plus HTML/JSON-LD/table text extraction. A local Node Playwright fallback is available when the server can run Node/browser binaries. Sites that block hosting-provider IPs may still need a PHP-callable remote scraping API.
 - Unsupported in this PHP port: Vertex AI mode via `GOOGLE_GENAI_USE_VERTEXAI`.
 
 For English-only JSON, keep `AUTO_TRANSLATE_ALL_TO_EN=true`,
@@ -128,3 +130,27 @@ REMOTE_FETCH_JSON_FIELD=html
 Supported template placeholders are `{url}` for URL-encoded target URL,
 `{url_raw}` for the raw target URL, and `{api_key}` for the URL-encoded remote
 fetch key.
+
+## Optional Local Playwright Fallback
+
+On a VPS or local machine with Node.js, PHP can fall back to a real Chromium
+render when cURL/remote fetch does not return enough readable content.
+
+```bash
+cd php-app
+npm install
+npm run install:playwright
+```
+
+Then enable it in `.env`:
+
+```text
+PLAYWRIGHT_RENDERER_ENABLED=true
+PLAYWRIGHT_NODE_BIN=node
+PLAYWRIGHT_SCRIPT_PATH=
+PLAYWRIGHT_TIMEOUT_MS=45000
+```
+
+Leave this disabled on shared hosting that cannot run Node/Chromium. When
+enabled, `WebScraper::extractTextFromUrl()` tries PHP cURL, then
+`REMOTE_FETCH_URL_TEMPLATE` if configured, then `scripts/render-page.js`.
